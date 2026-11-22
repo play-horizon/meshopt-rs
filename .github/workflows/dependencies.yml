@@ -1,0 +1,73 @@
+# Checks the dependencies of this branch every day, resolved as for a project that depends on
+# it: from a lockfile generated afresh, each dependency at the newest version its requirement
+# allows. `deny` runs cargo-deny with .github/deny.toml (security advisories, licences, duplicate
+# versions, sources), and `outdated` fails when a direct dependency (normal, build or dev) has a
+# release newer than its requirement allows, listing each in the job summary.
+name: Dependencies
+
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths: [.github/workflows/dependencies.yml, .github/deny.toml]
+
+permissions:
+  contents: read
+
+env:
+  # Resolving needs no particular toolchain; the newest stable one knows every manifest feature.
+  RUSTUP_TOOLCHAIN: stable
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - run: |
+          rm -f Cargo.lock
+          cargo generate-lockfile
+
+      - run: cargo deny --config .github/deny.toml check
+
+  outdated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal
+
+      # Locking a fresh lockfile, cargo prints each direct dependency it adds at a version older
+      # than the newest release as `Adding <name> v<version> (available: v<newer>)`.
+      - name: List the direct dependencies with a newer release
+        run: |
+          set -euo pipefail
+          rm -f Cargo.lock
+          cargo generate-lockfile --color never 2>&1 | tee "$RUNNER_TEMP/resolve.log"
+          outdated=$(sed -n -E 's/^ +Adding ([^ ]+) (v[^ ]+) \(available: (v[^)]+)\)$/- `\1` \2, newest \3/p' "$RUNNER_TEMP/resolve.log")
+          if [[ -z "$outdated" ]]; then
+            echo "Every direct dependency allows its newest release." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf '## Direct dependencies with a newer release\n\n%s\n' "$outdated" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Some direct dependencies have a newer release (see the job summary)"
+          exit 1

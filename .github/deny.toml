@@ -1,0 +1,23 @@
+# cargo-deny's configuration for the daily dependency check (.github/workflows/dependencies.yml):
+# it checks what a project depending on the crate builds, with every feature, dev-dependencies
+# left out.
+[graph]
+all-features = true
+exclude-dev = true
+
+# Every advisory fails the check: vulnerabilities, unmaintained and unsound crates, yanked versions.
+[advisories]
+yanked = "deny"
+
+# The licences a dependency may have; one under any other fails the check until its licence is
+# reviewed.
+[licenses]
+allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "warn"
+
+# crates.io only.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
