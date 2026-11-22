@@ -1,0 +1,66 @@
+# Fails when this branch is behind the repository the fork was forked from: when upstream's
+# default branch has commits the branch doesn't contain, which the job summary lists. Merging
+# upstream's default branch into the branch (never rebasing it: it is published) clears it.
+name: Upstream
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths: [.github/workflows/upstream.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Compare the branch with upstream
+        run: |
+          set -euo pipefail
+          parent=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent // error("not a fork") | "\(.full_name) \(.default_branch)"')
+          read -r upstream default_branch <<< "$parent"
+
+          git init --quiet
+          git remote add upstream "https://github.com/$upstream.git"
+          git remote add fork "https://github.com/$GITHUB_REPOSITORY.git"
+          # Commits and trees only: comparing histories needs no file contents, and a history
+          # can hold hundreds of megabytes of binaries.
+          git fetch --quiet --filter=blob:none --no-tags upstream \
+            "+refs/heads/$default_branch:refs/remotes/upstream/$default_branch"
+          # The commit the run is for, so a push in between can't change what is checked.
+          git fetch --quiet --filter=blob:none --no-tags fork "$GITHUB_SHA"
+
+          git log --format='%H %s' "upstream/$default_branch" "^$GITHUB_SHA" > "$RUNNER_TEMP/missing"
+          mapfile -t missing < "$RUNNER_TEMP/missing"
+
+          {
+            echo "## \`$GITHUB_REF_NAME\` compared with $upstream"
+            echo
+            if ((${#missing[@]} == 0)); then
+              echo "The branch contains every commit of upstream's \`$default_branch\`."
+            else
+              if ((${#missing[@]} == 1)); then
+                echo "**1 commit of upstream's \`$default_branch\` isn't on the branch:**"
+              else
+                echo "**${#missing[@]} commits of upstream's \`$default_branch\` aren't on the branch:**"
+              fi
+              echo
+              for commit in "${missing[@]}"; do
+                echo "- [\`${commit:0:7}\`](https://github.com/$upstream/commit/${commit%% *}) ${commit#* }"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ((${#missing[@]} > 0)); then
+            echo "::error::$GITHUB_REF_NAME is behind $upstream (see the job summary)"
+            exit 1
+          fi
