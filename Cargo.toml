@@ -41,6 +41,7 @@ include = [
     "vendor/src/vfetchoptimizer.cpp",
     "vendor/demo/clusterlod.h",
     "src/clusterlod.cpp",
+    "src/wasm32_allocator.cpp",
     "include_wasm32/*.h",
 ]
 edition = "2024"

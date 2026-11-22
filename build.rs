@@ -55,6 +55,10 @@ fn main() {
         // our own stripped down headers to provide the few
         // functions needed via LLVM intrinsics.
         build.flag("-isystem").flag("include_wasm32");
+        // Nor is there a C++ runtime: no exceptions to throw or catch, and operator new and
+        // operator delete come from the Rust allocator (src/wasm32_allocator.rs).
+        build.flag("-fno-exceptions");
+        build.file("src/wasm32_allocator.cpp");
         // The Wasm backend needs a compatible ar
         // which will most likely be available under
         // this name on Windows, via manual LLVM install
