@@ -1,0 +1,31 @@
+# Keeps this repository's scheduled workflows running. GitHub disables the schedules of a public
+# repository after 60 days without a commit; enabling a workflow through the API resets that
+# count, so every two weeks this enables each workflow that is enabled or was disabled for
+# inactivity, itself included, and never one disabled by hand. It makes no commit.
+name: Keepalive
+
+on:
+  schedule:
+    - cron: '17 3 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Enable the workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active" or .state == "disabled_inactivity") | "\(.id) \(.path)"' |
+            while read -r id path; do
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/enable"
+              echo "Enabled $path"
+            done
