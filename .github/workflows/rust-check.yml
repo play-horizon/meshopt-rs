@@ -52,3 +52,171 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --verbose --all-targets
+
+  # Links every function of the library into a wasm32 module, runs it under Node.js and compares
+  # what it computes with a native build of the same code. On wasm32 the C++ is built without a
+  # standard library (include_wasm32/, src/wasm32_allocator.*), so a symbol missing there shows
+  # only at link time, which building the library alone never reaches, and only for the code the
+  # module references.
+  wasm32:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: hecrj/setup-rust-action@v2
+        with:
+          rust-version: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install clang and llvm-ar
+        run: sudo apt-get update && sudo apt-get install --yes clang llvm
+
+      - name: Link, run and compare
+        run: |
+          set -euo pipefail
+          mkdir -p target/wasm32-link/src target/wasm32-link/examples
+          cat > target/wasm32-link/Cargo.toml <<'EOF'
+          [package]
+          name = "wasm32-link"
+          version = "0.0.0"
+          edition = "2024"
+          publish = false
+
+          [lib]
+          crate-type = ["cdylib", "rlib"]
+
+          [dependencies]
+          meshopt = { path = "../.." }
+
+          [workspace]
+          EOF
+          cat > target/wasm32-link/src/lib.rs <<'EOF'
+          /// Simplifies a strip of `count` vertices and round-trips its buffers through the codecs,
+          /// returning the sizes of what they made.
+          #[unsafe(no_mangle)]
+          pub extern "C" fn run(count: u32) -> u32 {
+              let vertices: Vec<[f32; 3]> = (0..count)
+                  .map(|i| [i as f32, (i * 7 % 5) as f32, (i % 3) as f32])
+                  .collect();
+              let indices: Vec<u32> = (0..count.saturating_sub(2))
+                  .flat_map(|i| [i, i + 1, i + 2])
+                  .collect();
+              let bytes: Vec<u8> = vertices.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+              let adapter = meshopt::VertexDataAdapter::new(&bytes, 12, 0).unwrap();
+              let simplified = meshopt::simplify(
+                  &indices,
+                  &adapter,
+                  indices.len() / 2,
+                  0.01,
+                  meshopt::SimplifyOptions::empty(),
+                  None,
+              );
+              let encoded_vertices = meshopt::encode_vertex_buffer(&vertices).unwrap();
+              let decoded: Vec<[f32; 3]> =
+                  meshopt::decode_vertex_buffer(&encoded_vertices, vertices.len()).unwrap();
+              let encoded_indices = meshopt::encode_index_buffer(&indices, vertices.len()).unwrap();
+              let decoded_indices: Vec<u32> =
+                  meshopt::decode_index_buffer(&encoded_indices, indices.len()).unwrap();
+              // The index codec keeps the triangles' order, not where each starts.
+              let rotated = |triangles: &[u32]| -> Vec<[u32; 3]> {
+                  triangles
+                      .chunks_exact(3)
+                      .map(|t| {
+                          let first = (0..3).min_by_key(|&k| t[k]).unwrap();
+                          [t[first], t[(first + 1) % 3], t[(first + 2) % 3]]
+                      })
+                      .collect()
+              };
+              assert!(decoded == vertices);
+              assert!(rotated(&decoded_indices) == rotated(&indices));
+              (simplified.len() + encoded_vertices.len() + encoded_indices.len()) as u32
+          }
+
+          /// The position exponent of a box of each size, which the library works out with frexpf:
+          /// a large one, a small one, a subnormal one (whose exponent the library raises to the
+          /// smallest allowed, so this only runs that branch: the next step checks frexpf itself)
+          /// and an empty one.
+          #[unsafe(no_mangle)]
+          pub extern "C" fn exponent(case: u32) -> i32 {
+              let size = [1000.25, 0.75, 1e-40, 0.0][case as usize % 4];
+              meshopt::compute_position_exponent([0.0; 3], [size, size / 2.0, 0.0], -126, 16)
+          }
+
+          /// Every function of the library, by address, so that the module links all of them.
+          #[unsafe(no_mangle)]
+          pub extern "C" fn every_function() -> usize {
+              [
+          EOF
+          grep -oE 'pub fn meshopt_[A-Za-z0-9_]+' gen/bindings.rs | sed -E 's/pub fn (.*)/        meshopt::ffi::\1 as *const () as usize,/' | sort -u \
+            >> target/wasm32-link/src/lib.rs
+          cat >> target/wasm32-link/src/lib.rs <<'EOF'
+              ]
+              .iter()
+              .fold(0, |all, function| all ^ function)
+          }
+          EOF
+          cat > target/wasm32-link/examples/native.rs <<'EOF'
+          use wasm32_link::{exponent, run};
+
+          fn main() {
+              let exponents: Vec<String> = (0..4).map(|case| exponent(case).to_string()).collect();
+              println!("{} {} {}", run(1000), run(5000), exponents.join(" "));
+          }
+          EOF
+          cd target/wasm32-link
+          cargo build --release --target wasm32-unknown-unknown
+          wasm=target/wasm32-unknown-unknown/release/wasm32_link.wasm
+          node -e "
+            const module = new WebAssembly.Module(require('fs').readFileSync('$wasm'));
+            const imports = WebAssembly.Module.imports(module);
+            if (imports.length > 0) throw new Error('unresolved imports: ' + JSON.stringify(imports));
+            const { run, exponent, every_function } = new WebAssembly.Instance(module, {}).exports;
+            every_function();
+            console.log([run(1000), run(5000), exponent(0), exponent(1), exponent(2), exponent(3)].join(' '));
+          " > wasm32.txt
+          cargo run --release --example native > native.txt
+          echo "wasm32: $(cat wasm32.txt), native: $(cat native.txt)"
+          diff wasm32.txt native.txt
+
+      # The wasm32 headers define frexpf themselves (include_wasm32/math.h): compiled natively,
+      # it must give what the C library's frexpf gives for every float.
+      - name: Compare frexpf with the C library's
+        run: |
+          set -euo pipefail
+          mkdir -p target/frexpf
+          cat > target/frexpf/compare.cpp <<'EOF'
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstring>
+
+          #include "../../include_wasm32/math.h"
+
+          int main()
+          {
+          	unsigned long long mismatches = 0;
+          	for (uint64_t pattern = 0; pattern <= 0xffffffffull; ++pattern)
+          	{
+          		uint32_t bits = uint32_t(pattern);
+          		float value;
+          		memcpy(&value, &bits, sizeof(value));
+          		int expected_exponent = 0, exponent = 0;
+          		float expected = std::frexp(value, &expected_exponent);
+          		float mantissa = meshopt_wasm32_frexpf(value, &exponent);
+          		bool same = std::isnan(value)
+          			? std::isnan(mantissa)
+          			: memcmp(&expected, &mantissa, sizeof(float)) == 0 && (std::isinf(value) || exponent == expected_exponent);
+          		if (!same && mismatches++ < 10)
+          			printf("%08x: frexpf gives %a and %d, the wasm32 one %a and %d\n", bits, expected, expected_exponent, mantissa, exponent);
+          	}
+          	printf("%llu mismatches\n", mismatches);
+          	return mismatches == 0 ? 0 : 1;
+          }
+          EOF
+          clang++ -std=c++11 -O2 target/frexpf/compare.cpp -o target/frexpf/compare
+          target/frexpf/compare
