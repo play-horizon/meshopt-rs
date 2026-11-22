@@ -59,7 +59,7 @@ bitflags = "2.13"
 cc = { version = "1.0" }
 
 [build-dependencies.bindgen]
-version = "0.72.1"
+version = "0.73.2"
 optional = true
 
 [dev-dependencies]
